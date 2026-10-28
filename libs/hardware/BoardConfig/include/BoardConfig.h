@@ -78,12 +78,15 @@
 #ifndef FREEINK_DEVICE_WS397
 #define FREEINK_DEVICE_WS397 0
 #endif
+#ifndef FREEINK_DEVICE_E1001
+#define FREEINK_DEVICE_E1001 0
+#endif
 
 // --- 2) Coherence: exactly one MCU family, at least one device ---------------
 #if !(FREEINK_DEVICE_X4 || FREEINK_DEVICE_X3 || FREEINK_DEVICE_X4PRO || FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_M5 || \
       FREEINK_DEVICE_MURPHY || FREEINK_DEVICE_DELINK || FREEINK_DEVICE_LILYGO || FREEINK_DEVICE_M5PAPER ||               \
       FREEINK_DEVICE_STICKY || FREEINK_DEVICE_PAPERMONO || FREEINK_DEVICE_PAPERS3 || FREEINK_DEVICE_MURPHY_M4 ||         \
-      FREEINK_DEVICE_EEGO_A4 || FREEINK_DEVICE_ONEPAGE || FREEINK_DEVICE_WS397)
+      FREEINK_DEVICE_EEGO_A4 || FREEINK_DEVICE_ONEPAGE || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_E1001)
 #error \
     "FreeInk: no device selected. Pass at least one -DFREEINK_DEVICE_<NAME> (X4, X3, X4PRO, X4CLASSIC, M5, MURPHY, DELINK, LILYGO, M5PAPER, STICKY, PAPERMONO, PAPERS3, MURPHY_M4, EEGO_A4, ONEPAGE, WS397) in your build env — see platformio.sample.ini."
 #endif
@@ -96,7 +99,7 @@
 #define FREEINK_MCU_S3                                                                                    \
   (FREEINK_DEVICE_M5 || FREEINK_DEVICE_MURPHY || FREEINK_DEVICE_DELINK || FREEINK_DEVICE_LILYGO ||        \
    FREEINK_DEVICE_STICKY || FREEINK_DEVICE_X4PRO || FREEINK_DEVICE_X4CLASSIC || FREEINK_DEVICE_PAPERMONO ||  \
-   FREEINK_DEVICE_PAPERS3 || FREEINK_DEVICE_MURPHY_M4 || FREEINK_DEVICE_EEGO_A4 || FREEINK_DEVICE_WS397)
+   FREEINK_DEVICE_PAPERS3 || FREEINK_DEVICE_MURPHY_M4 || FREEINK_DEVICE_EEGO_A4 || FREEINK_DEVICE_WS397 || FREEINK_DEVICE_E1001)
 #define FREEINK_MCU_ESP32 (FREEINK_DEVICE_M5PAPER)
 #if (FREEINK_MCU_C3 + FREEINK_MCU_C61 + FREEINK_MCU_S3 + FREEINK_MCU_ESP32) != 1
 #error \
@@ -185,6 +188,12 @@
 #define FREEINK_DRIVER_PAPER_MONO 0
 #endif
 // EEGO Reader A4: UC8279C (768x552), UC81xx KW-family sibling of the UC8279 X4 driver.
+// Seeed reTerminal E1001: 7.5" 800x480 UC8179, own compact driver (not the X4-family one).
+#if FREEINK_DEVICE_E1001
+#define FREEINK_DRIVER_UC8179_E1001 1
+#else
+#define FREEINK_DRIVER_UC8179_E1001 0
+#endif
 #if FREEINK_DEVICE_EEGO_A4
 #define FREEINK_DRIVER_UC8279C 1
 #else
@@ -400,6 +409,7 @@ enum class Board : uint8_t {
   EegoA4,     // EEGO Reader A4: ESP32-S3, UC8279C 768x552 SPI panel, GSLX680 touch, PCF8563 RTC
   OnePage,    // OnePage: ESP32-C61, SSD1677 800x480 SPI panel, 4-key ADC ladder + 3 side keys
   WsEpaper397,  // Waveshare ESP32-S3-ePaper-3.97: SSD1677 800x480, 3 keys + BOOT, AXP2101 PMIC
+  SeeedE1001,   // Seeed reTerminal E1001: ESP32-S3, UC8179 7.5" 800x480 SPI panel, 3 keys, microSD over SPI
 };
 
 // How the board reports button presses.
@@ -1570,6 +1580,49 @@ constexpr BoardProfile WS_EPAPER_397 = {
     // The SHTC3 (0x70) has no EnvironmentSensor backend yet, so it stays 0.
     {41, 42, 400000, 0x51, 0, 0x6B, 0, RtcType::Pcf85063, ImuType::Qmi8658}};
 
+
+// --- Seeed reTerminal E1001: ESP32-S3R8 (8 MB PSRAM, 32 MB flash), UC8179 7.5" 800x480 ---
+// Pins from Draftling's board header, CONFIRMED on a real unit by the e1001-probe bring-up sketch
+// (MicroSlate-workspace/notes/E1001-reference.md): full refresh 1.6 s; microSD over SPI (shared
+// SCK7/MOSI9, MISO8, CS14, power-enable 16 HIGH); I2C0 SDA19/SCL20 saw SHT40 0x44 + PCF8563 0x51; I2C1
+// SDA39/SCL40 saw the charger 0x6B; battery ADC GPIO1 (x2 divider, divider enable GPIO21 HIGH). Three
+// active-low keys on GPIO3 / GPIO4 / GPIO5. No touch, no frontlight.
+//   * The battery-divider enable is carried as a power "latch" (driven HIGH first thing in boot).
+//   * Keys: DigitalConfirmPowerHold. GPIO3 (green) = confirm click / sleep hold, GPIO4 = up, GPIO5 = down.
+//   * PENDING hardware: key roles on the case, panel orientation (NO_FLIP assumed), SD speed.
+constexpr BoardProfile SEEED_E1001 = {
+    Board::SeeedE1001,
+    "seeed_e1001",
+    InputStyle::DigitalConfirmPowerHold,  // green key: click confirms, hold sleeps (as on the Sticky)
+    DisplayController::UC8179,
+    800,
+    480,
+    // SCK7 MOSI9 CS10 DC11 RST12 BUSY13; the panel rail is always on.
+    {7, 9, 10, 11, 12, 13, PIN_UNASSIGNED},
+    4000000,  // displaySpiHz: probe-verified at 2 MHz; 4 MHz is the conservative first step up
+    // SD over SPI, sharing SCK/MOSI with the panel: {sclk, miso, mosi, cs, powerEnable, separateSpi, spiHz}.
+    {7, 8, 9, 14, 16, false, 10000000},
+    // {back, confirm, left, right, up, down, power, powerActiveHigh}
+    // Bench-verified pins: KEY0=GPIO3 (green) = confirm + power (click / hold), KEY1=GPIO4 up, KEY2=GPIO5 down.
+    {PIN_UNASSIGNED, 3, PIN_UNASSIGNED, PIN_UNASSIGNED, 4, 5, 3, false},
+    1,  // batteryAdc: GPIO1 through a 10k/10k divider
+    PIN_UNASSIGNED,
+    2.0f,
+    PIN_UNASSIGNED,
+    NO_TOUCH,
+    NO_FRONTLIGHT,
+    NO_AUDIO,
+    NO_LEDS,
+    NO_FLIP,
+    NO_SDMMC,
+    NO_GAUGE,
+    NO_MIC,
+    // I2C0 SDA19/SCL20: PCF8563 RTC (0x51); the SHT40 (0x44) has no backend here.
+    {19, 20, 400000, 0x51, 0, 0, 0, RtcType::Pcf8563, ImuType::None},
+    1.0f,  // uiScale: button/keyboard device
+    // latch0 = GPIO21, the battery-divider enable: must be HIGH for the ADC reading to mean anything.
+    {21, PIN_UNASSIGNED}};
+
 // --- Xteink X4 Pro — ESP32-S3, 800x480 EPD + GT911 touch + warm/cold frontlight ---
 // Recovered from the OEM flash dump (x4pro_flash_dump.bin); full evidence and confidence
 // levels in docs/xteink-x4pro-support.md. This is a DISTINCT device from the C3
@@ -1852,12 +1905,15 @@ constexpr uint32_t MAX_FRAMEBUFFER_BYTES = cmax(
                         FREEINK_DEVICE_MURPHY_M4 ? panelBytes(MURPHY_M4) : 0u),
                    cmax(cmax(FREEINK_DEVICE_EEGO_A4 ? panelBytes(EEGO_A4) : 0u,
                              FREEINK_DEVICE_ONEPAGE ? panelBytes(ONEPAGE) : 0u),
-                        FREEINK_DEVICE_WS397 ? panelBytes(WS_EPAPER_397) : 0u)))));
+                        cmax(FREEINK_DEVICE_WS397 ? panelBytes(WS_EPAPER_397) : 0u,
+                             FREEINK_DEVICE_E1001 ? panelBytes(SEEED_E1001) : 0u))))));
 
 // Compile-time default device — the profile ACTIVE starts as. With a single
 // device in the build this is the only device; with several same-MCU devices it
 // is the boot default until the consumer calls selectDevice().
-#if FREEINK_DEVICE_WS397
+#if FREEINK_DEVICE_E1001
+constexpr BoardProfile DEFAULT_DEVICE = SEEED_E1001;
+#elif FREEINK_DEVICE_WS397
 constexpr BoardProfile DEFAULT_DEVICE = WS_EPAPER_397;
 #elif FREEINK_DEVICE_ONEPAGE
 constexpr BoardProfile DEFAULT_DEVICE = ONEPAGE;
@@ -1987,6 +2043,11 @@ inline bool selectDevice(Board which) {
       ACTIVE = WS_EPAPER_397;
       break;
 #endif
+#if FREEINK_DEVICE_E1001
+    case Board::SeeedE1001:
+      ACTIVE = SEEED_E1001;
+      break;
+#endif
     default:
       return false;
   }
@@ -2010,6 +2071,7 @@ inline bool isPaperMono() { return ACTIVE.board == Board::PaperMono; }
 inline bool isEegoA4() { return ACTIVE.board == Board::EegoA4; }
 inline bool isOnePage() { return ACTIVE.board == Board::OnePage; }
 inline bool isWsEpaper397() { return ACTIVE.board == Board::WsEpaper397; }
+inline bool isSeeedE1001() { return ACTIVE.board == Board::SeeedE1001; }
 inline bool hasTouch() { return ACTIVE.touch.controller != TouchController::None; }
 inline bool hasHomeKey() { return ACTIVE.touch.hasHomeKey; }
 inline bool hasPwmFrontlight() { return ACTIVE.frontlight.gpio != PIN_UNASSIGNED || ACTIVE.frontlight.viaPm1Pwm; }
