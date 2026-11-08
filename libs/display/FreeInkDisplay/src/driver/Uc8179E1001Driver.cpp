@@ -31,6 +31,7 @@ constexpr uint8_t CMD_PTOUT = 0x92;
 constexpr uint8_t CMD_CCSET = 0xE0;
 constexpr uint8_t CMD_PWS = 0xE3;
 constexpr uint8_t CMD_TSSET = 0xE5;
+constexpr uint8_t CMD_LUTC = 0x20;  // VCOM, then 0x21 WW, 0x22 KW, 0x23 WK, 0x24 KK, 0x25 border
 
 constexpr uint16_t PANEL_W = 800;
 constexpr uint16_t PANEL_H = 480;
@@ -39,15 +40,13 @@ constexpr uint32_t PANEL_BYTES = static_cast<uint32_t>(PANEL_WB) * PANEL_H;
 
 constexpr uint8_t TSSET_FULL = 0x5A;
 constexpr uint8_t TSSET_PARTIAL = 0x6E;
-constexpr uint8_t CMD_VDCS = 0x82;
-constexpr uint8_t CMD_LUTC = 0x20;  // VCOM, then 0x21 WW, 0x22 KW, 0x23 WK, 0x24 KK, 0x25 border
 
-// Tuning set from Settings (see uc8179E1001Tune).
-uint8_t g_frames = 12;   // register waveform, frames per phase (16 ~ 770 ms, 12 ~ 570 ms); 0 = the built-in 870 ms one
-int g_vcom = -1;
-uint16_t g_fullEvery = 0xFFFF;   // never clean up: the built-in waveform does not ghost
-bool g_cfgChanged = false;
-bool g_softClean = true;
+// Register waveform frames per drive phase (about 20 ms each): 16 is about 770 ms per update.
+// Fewer frames are faster but leave more traces (12 already did on a real unit).
+constexpr uint8_t kFastFrames = 16;
+
+bool g_fast = false;         // uc8179E1001SetFastWaveform
+bool g_modeChanged = false;  // the next fast update re-initialises with the other waveform
 
 class Uc8179E1001Driver : public PanelDriver {
  public:
@@ -77,17 +76,12 @@ class Uc8179E1001Driver : public PanelDriver {
 
   void display(EpdBus& bus, const uint8_t* fb, const uint8_t*, RefreshMode mode, bool turnOff) override {
     if (!fb) return;
-    const bool due = _sinceFull >= g_fullEvery;
-    if (mode == RefreshMode::Fast && _oldValid && _shown && (!due || g_softClean)) {
-      if (due) {
-        partial(bus, fb, 0, 0, PANEL_W, PANEL_H, true);
-      } else {
-        // Send only the part of the screen that changed; the panel stays powered between updates
-        // (deepSleep and the full refresh still power it down).
-        uint16_t x, y, w, h;
-        if (!dirtyBox(fb, x, y, w, h)) return;
-        partial(bus, fb, x, y, w, h);
-      }
+    if (mode == RefreshMode::Fast && _oldValid && _shown) {
+      // Send only the part of the screen that changed; the panel stays powered between updates
+      // (deepSleep and the full refresh power it down).
+      uint16_t x, y, w, h;
+      if (!dirtyBox(fb, x, y, w, h)) return;
+      partial(bus, fb, x, y, w, h);
       remember(fb);
       return;
     }
@@ -103,10 +97,6 @@ class Uc8179E1001Driver : public PanelDriver {
       display(bus, fb, prev, RefreshMode::Full, turnOff);
       return;
     }
-    if (_sinceFull >= g_fullEvery) {  // clean-up due: soft or full, whole screen
-      display(bus, fb, prev, RefreshMode::Fast, turnOff);
-      return;
-    }
     partial(bus, fb, x, y, w, h);
     remember(fb);
   }
@@ -117,7 +107,6 @@ class Uc8179E1001Driver : public PanelDriver {
   bool _oldValid = false;
   bool _shown = false;          // _shadow holds the frame the panel is showing
   uint8_t* _shadow = nullptr;   // copy of the last frame sent, to find what changed
-  uint16_t _sinceFull = 0;
 
   void remember(const uint8_t* fb) {
     if (!_shadow) {
@@ -160,7 +149,7 @@ class Uc8179E1001Driver : public PanelDriver {
     for (int i = 0; i < 42; i++) {
       uint8_t b = 0;
       if (i == 0) b = levels;
-      else if (i == 1 || i == 3) b = g_frames;
+      else if (i == 1 || i == 3) b = kFastFrames;
       else if (i == 5) b = 1;
       bus.data(b);
     }
@@ -168,10 +157,6 @@ class Uc8179E1001Driver : public PanelDriver {
   void loadRegisterWaveform(EpdBus& bus) {
     bus.cmd(CMD_PSR);
     bus.data(0x3F);  // KW mode, LUT from registers
-    if (g_vcom >= 0) {
-      bus.cmd(CMD_VDCS);
-      bus.data(static_cast<uint8_t>(g_vcom));
-    }
     bus.cmd(CMD_CDI);
     bus.data(0x39);
     bus.data(0x07);
@@ -263,7 +248,6 @@ class Uc8179E1001Driver : public PanelDriver {
 
   // Flashing refresh: OLD plane = complement of the new frame, so every pixel is driven.
   void full(EpdBus& bus, const uint8_t* fb) {
-    const uint32_t t0 = millis();
     powerOff(bus);  // re-init needs the booster off; also drops partial mode
     initCommon(bus);
     powerOn(bus);
@@ -273,34 +257,21 @@ class Uc8179E1001Driver : public PanelDriver {
     bus.data(0x02);
     bus.cmd(CMD_TSSET);
     bus.data(TSSET_FULL);
-    const uint32_t tStream = millis();
     bus.cmd(CMD_DRF);
     bus.waitRefreshComplete(" e1001_DRF_full");
     streamRows(bus, CMD_DTM1, fb, 0, PANEL_WB, 0, PANEL_H, false);  // OLD := shown frame
     _oldValid = true;
-    _sinceFull = 0;
-#if defined(MS_EDITOR_PROF)
-    Serial.printf("[epd] full %lu ms\n", (unsigned long)(millis() - t0));
-#endif
   }
 
-  void partial(EpdBus& bus, const uint8_t* fb, uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool clean = false) {
-    const uint32_t t0 = millis();
-    if (inputMs) {
-#if defined(MS_EDITOR_PROF)
-      Serial.printf("[epd] key->draw start %lu ms, draw->driver %lu ms\n", (unsigned long)(updateMs - inputMs), (unsigned long)(t0 - updateMs));
-#endif
-      inputMs = 0;
-    }
-    if (g_cfgChanged) {  // a Settings change: re-initialise with the new waveform
+  // Fast update of one window with the built-in or the register waveform (uc8179E1001SetFastWaveform).
+  void partial(EpdBus& bus, const uint8_t* fb, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+    if (g_modeChanged) {  // the app switched waveform: re-initialise with the new one
       powerOff(bus);
-      _partialMode = false;
-      g_cfgChanged = false;
+      g_modeChanged = false;
     }
-    const bool init = !_partialMode;
     if (!_partialMode) {
       initCommon(bus);
-      if (g_frames > 0) {
+      if (g_fast) {
         loadRegisterWaveform(bus);
       } else {
         bus.cmd(CMD_CCSET);
@@ -311,50 +282,35 @@ class Uc8179E1001Driver : public PanelDriver {
       powerOn(bus);
       _partialMode = true;
     }
-    _sinceFull = clean ? 0 : _sinceFull + 1;
-    const uint32_t tInit = millis();
     const uint16_t xs = x & ~7u;
     const uint16_t xe = static_cast<uint16_t>((x + w - 1) | 7);
     const uint16_t cols = static_cast<uint16_t>((xe - xs + 1) / 8);
 
     bus.cmd(CMD_PTIN);
     setWindow(bus, xs, y, static_cast<uint16_t>(cols * 8), h);
-    // Soft clean-up: tell the panel every pixel is changing (OLD = complement of the new frame), so each one
-    // is driven again to its own colour with the fast waveform, with no full black flash.
-    if (clean) streamRows(bus, CMD_DTM1, fb, xs / 8, cols, y, h, true);
     streamRows(bus, CMD_DTM2, fb, xs / 8, cols, y, h, false);
-    const uint32_t tStream = millis();
     bus.cmd(CMD_DRF);
     bus.waitRefreshComplete(" e1001_DRF_part");
-    const uint32_t tDrf = millis();
     bus.cmd(CMD_PTOUT);
 
     bus.cmd(CMD_PTIN);
     setWindow(bus, xs, y, static_cast<uint16_t>(cols * 8), h);
     streamRows(bus, CMD_DTM1, fb, xs / 8, cols, y, h, false);  // OLD := shown window
     bus.cmd(CMD_PTOUT);
-#if defined(MS_EDITOR_PROF)
-    Serial.printf("[epd] part %ux%u@%u,%u total %lu (init %lu stream %lu drf %lu old %lu)%s\n", (unsigned)w, (unsigned)h, (unsigned)x, (unsigned)y,
-                  (unsigned long)(millis() - t0), (unsigned long)(tInit - t0), (unsigned long)(tStream - tInit), (unsigned long)(tDrf - tStream), (unsigned long)(millis() - tDrf), init ? " +init" : "");
-#endif
   }
 };
 
 }  // namespace
-
-volatile uint32_t inputMs = 0, updateMs = 0;
 
 PanelDriver& uc8179E1001Driver() {
   static Uc8179E1001Driver instance;
   return instance;
 }
 
-void uc8179E1001Tune(uint8_t framesPerPhase, int vcom, uint16_t fullEvery, bool softClean) {
-  g_softClean = softClean;
-  g_frames = framesPerPhase;
-  g_vcom = vcom;
-  g_fullEvery = fullEvery > 0 ? fullEvery : 0xFFFF;   // 0 = never clean up
-  g_cfgChanged = true;
+void uc8179E1001SetFastWaveform(bool fast) {
+  if (fast == g_fast) return;
+  g_fast = fast;
+  g_modeChanged = true;
 }
 
 }  // namespace freeink
